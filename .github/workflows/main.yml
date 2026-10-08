@@ -19,13 +19,19 @@ jobs:
       with:
         python-version: "3.10"
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-
-    - name: Check syntax for all Python files
+    - name: Check syntax
       run: |
         python -m py_compile *.py
-        # 如果你的 scripts 目录下有 py 文件，也可以加上：
-        # python -m py_compile scripts/*.py
+
+    - name: Package source snapshot
+      run: |
+        mkdir -p dist
+        zip -r dist/vacm-decompiled-source.zip \
+            *.py requirements.txt README.md scripts/ \
+            -x "*.pyc" -x "__pycache__/*"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: vacm-decompiled-source
+        path: dist/vacm-decompiled-source.zip
