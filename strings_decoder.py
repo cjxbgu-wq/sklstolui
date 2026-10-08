@@ -1,0 +1,1254 @@
+# -*- coding: utf-8 -*-
+"""
+strings_decoder.py — 去混淆字符串的【静态】权威实现
+目标二进制: Vacm_afasds.dylib (arm64)
+
+本模块取代此前所有 `# [恢复] 运行时 dump 占位说明 需运行时 dump` 的占位实现。
+
+混淆器模型（已完全静态还原，并用 arm64emu 逐块 replay 验证）
+------------------------------------------------------------
+每个被保护的函数序言里插入一次性解密块，签名固定为：
+
+    adrp xN, #0x14e0000
+    add  xN, xN, #<flag>
+    ldar wR, [xN]            ; 读 __DATA,__bss 的 dispatch_once 标志
+    subs / cset / tbnz      ; 已执行则整块跳过
+    ...
+    ldrb | ldrh | ldr  <源缓冲>
+    eor  wR, wR, #<立即数>    ; 每个位置使用不同立即数
+    strb | strh | str  <目标> ; 目标地址 ≠ 源地址
+    stlr w9, [xN]            ; 置位「已执行」
+
+关键结论
+--------
+1. 密钥是逐位置不同的立即数，不是统一滚动序列。
+2. 源与目标是不同地址：磁盘上的源密文永不改变，明文写入邻近目标缓冲。
+3. **全库共 131 个解密块**（此前只找到 15 个，因为那 15 个恰好是明文落在
+   0x3f6000 页的那一批；flag 覆盖 0x14e0b94 .. 0x14f2130）。每个块向 __DATA 写入
+   1..109 字节，共 5830 字节，覆盖 0x3f6000 .. 0x400fff 共 10 个页面。
+   其中 57 个块不产出可读字符串，见 NON_STRING_BLOCKS。
+4. 常量字符串记录为 32 字节 stride：``[pad=0][isa][ptr][len]``。
+   注意 pad 在 ``isa`` **之前**；``len`` 之后那个 qword 通常已经是字符串缓冲本身。
+5. **isa 决定编码，同时决定 len 的单位**（这是最容易踩的坑）::
+
+       isa = 0x7c8 → UTF-8/ASCII，len 以【字节】计，解密用 strb
+       isa = 0x7d0 → UTF-16LE，  len 以【UTF-16 code unit】计，解密用 strh
+
+   早前的解码器对两者都只读 ``len`` 字节，于是每条中文文案都被截掉一半
+   （"请输入有效的 URL" → "请输入有效"，"播放失败" → "播放"）。
+   正确写法是 UTF-16LE 读 ``2 * len`` 字节。
+6. 每个解密块实际写入 ``len + 1`` 个 code unit，即末尾的 NUL 终止符。
+   用「紧随其后是否为 NUL」可以把目标明文缓冲与其仍在加密的源孪生区分开，
+   这也是本表除可打印性之外再加的一道交叉验证。
+7. 宿主 App 白名单（[证实]，与结构体字段逐一吻合）::
+
+       struct 0x3F6820 → ptr 0x3f6721 len 11 → "tencent.xin"
+       struct 0x3F68A0 → ptr 0x3f67aa len  6 → "wechat"
+
+   早前记录的 0x3f6820 / 0x3f68a0 / 0x3f67e0 / 0x3f6860 整体偏移了 8 字节：
+   它们是结构体本体（pad 槽），``isa`` 在 ``+8``。
+"""
+
+import struct
+
+# ---------------------------------------------------------------------------
+# [证实] 全部 131 个解密块（entry, 字节数, __bss one-shot flag）
+# flag 取自 arm64emu 实际停机地址，而非纯文本扫描推测值。
+# ---------------------------------------------------------------------------
+DEOBF_SITES = (
+    (0x00276ED4, 3556, 0x14E0B94),
+    (0x00277CB8, 616, 0x14E0B98),
+    (0x00277F20, 564, 0x14E0B9C),
+    (0x00279644, 2548, 0x14E0BC0),
+    (0x0027A584, 864, 0x14E0BD8),
+    (0x0027AAA4, 488, 0x14E0BE0),
+    (0x0027B8A8, 1016, 0x14E0C10),
+    (0x0027C0E0, 452, 0x14E0C28),
+    (0x0027C2A4, 5908, 0x14E0C2C),
+    (0x0027DD74, 1908, 0x14E0C44),
+    (0x0027E5E4, 6564, 0x14E0C4C),
+    (0x002801D0, 796, 0x14E0C60),
+    (0x00281A80, 840, 0x14E0CB4),
+    (0x00285A10, 1820, 0x14E0E78),
+    (0x00286A00, 676, 0x14E0E94),
+    (0x002887B4, 15536, 0x14E111C),
+    (0x0028D490, 3536, 0x14E1188),
+    (0x0028E5E8, 2944, 0x14E1194),
+    (0x00290158, 16768, 0x14E11D0),
+    (0x002945CC, 2176, 0x14E11E4),
+    (0x002951CC, 3780, 0x14E11F0),
+    (0x00296474, 652, 0x14E1214),
+    (0x00296700, 712, 0x14E1218),
+    (0x002969C8, 1276, 0x14E121C),
+    (0x00296FA4, 1288, 0x14E1224),
+    (0x002974AC, 2932, 0x14E1228),
+    (0x002983DC, 1748, 0x14E1240),
+    (0x0029922C, 1168, 0x14E1250),
+    (0x002996BC, 956, 0x14E1254),
+    (0x00299E9C, 2272, 0x14E1260),
+    (0x0029B3A4, 1132, 0x14E12AC),
+    (0x0029B810, 820, 0x14E12B0),
+    (0x0029BF98, 304, 0x14E12CC),
+    (0x0029C0C8, 11528, 0x14E12D4),
+    (0x0029EED4, 5028, 0x14E12E4),
+    (0x002A0A4C, 1348, 0x14E12F0),
+    (0x002A0F90, 1612, 0x14E12F4),
+    (0x002A190C, 12176, 0x14E1304),
+    (0x002A489C, 3436, 0x14E1308),
+    (0x002A5798, 11432, 0x14E1318),
+    (0x002A8884, 1528, 0x14E1348),
+    (0x002A8E7C, 476, 0x14E1350),
+    (0x002A92B4, 504, 0x14E1358),
+    (0x002AB370, 4188, 0x14F13F8),
+    (0x002AC5AC, 1924, 0x14F1410),
+    (0x002AD4A0, 1024, 0x14F145C),
+    (0x002AD930, 6580, 0x14F1464),
+    (0x002B0EAC, 3344, 0x14F16D4),
+    (0x002B1D04, 5664, 0x14F16DC),
+    (0x002B3324, 2040, 0x14F14A0),
+    (0x002B3B1C, 580, 0x14F16E8),
+    (0x002B5FD0, 2392, 0x14F16F4),
+    (0x002B6994, 11948, 0x14F1708),
+    (0x002B98F4, 1316, 0x14F1AD0),
+    (0x002BA1AC, 1168, 0x14F1AE4),
+    (0x002BACAC, 976, 0x14F1B00),
+    (0x002C6958, 968, 0x14F1B14),
+    (0x002C6D20, 1576, 0x14F1B1C),
+    (0x002C7348, 1388, 0x14F1B20),
+    (0x002C78B4, 6356, 0x14F1B24),
+    (0x002C923C, 1892, 0x14F1B2C),
+    (0x002C99A0, 1156, 0x14F1B30),
+    (0x002CB004, 2924, 0x14F1B64),
+    (0x002CBB70, 1096, 0x14F1B68),
+    (0x002CBFB8, 1048, 0x14F1B6C),
+    (0x002CC538, 1164, 0x14F1B78),
+    (0x002CC9C4, 2348, 0x14F1B7C),
+    (0x002CD2F0, 1088, 0x14F1B80),
+    (0x002CD730, 1128, 0x14F1B84),
+    (0x002CDB98, 1084, 0x14F1B88),
+    (0x002CE078, 1048, 0x14F1B94),
+    (0x002CE544, 3588, 0x14F1B9C),
+    (0x002CF348, 1264, 0x14F1BA0),
+    (0x002CF838, 1264, 0x14F1BA4),
+    (0x002CFD28, 1268, 0x14F1BA8),
+    (0x002D02A8, 2992, 0x14F1BB4),
+    (0x002D0E58, 1136, 0x14F1BB8),
+    (0x002D137C, 6364, 0x14F1BC0),
+    (0x002D2E74, 1272, 0x14F1BD4),
+    (0x002D3494, 1584, 0x14F1BE0),
+    (0x002D3FFC, 1668, 0x14F1C00),
+    (0x002D4680, 724, 0x14F1C04),
+    (0x002D4ABC, 3936, 0x14F1C10),
+    (0x002D5A1C, 732, 0x14F1C14),
+    (0x002D5CF8, 732, 0x14F1C18),
+    (0x002D61EC, 728, 0x14F1C28),
+    (0x002D64C4, 732, 0x14F1C2C),
+    (0x002D67A0, 1392, 0x14F1C34),
+    (0x002D6DC4, 5504, 0x14F1C3C),
+    (0x002D8528, 1416, 0x14F1C4C),
+    (0x002D8B1C, 2208, 0x14F1C54),
+    (0x002D9428, 1452, 0x14F1C5C),
+    (0x002D9B30, 952, 0x14F1C68),
+    (0x002D9FA4, 460, 0x14F1C70),
+    (0x002DA170, 2008, 0x14F1C74),
+    (0x002DAAB0, 3828, 0x14F1C80),
+    (0x002DB9A4, 1792, 0x14F1C84),
+    (0x002DC158, 1420, 0x14F1C8C),
+    (0x002DCC80, 11672, 0x14F1CC8),
+    (0x002DFA18, 1148, 0x14F1CD4),
+    (0x002DFE94, 1168, 0x14F1CD8),
+    (0x002E0324, 1284, 0x14F1CDC),
+    (0x002E0828, 1484, 0x14F1CE0),
+    (0x002E0DF4, 1204, 0x14F1CE4),
+    (0x002E12A8, 1448, 0x14F1CE8),
+    (0x002E1850, 1212, 0x14F1CEC),
+    (0x002E1D0C, 1244, 0x14F1CF0),
+    (0x002E21E8, 1140, 0x14F1CF4),
+    (0x002E265C, 1236, 0x14F1CF8),
+    (0x002E2B30, 1156, 0x14F1CFC),
+    (0x002E2FB4, 1184, 0x14F1D00),
+    (0x002E3454, 1280, 0x14F1D04),
+    (0x002E3954, 1212, 0x14F1D08),
+    (0x002E3E10, 1232, 0x14F1D0C),
+    (0x002E42E0, 1212, 0x14F1D10),
+    (0x002E479C, 1272, 0x14F1D14),
+    (0x002E4DE8, 1312, 0x14F1D20),
+    (0x002E5308, 1104, 0x14F1D24),
+    (0x002E5758, 1148, 0x14F1D28),
+    (0x002E5BD4, 1160, 0x14F1D2C),
+    (0x002E7068, 11760, 0x14F1FF0),
+    (0x002EA284, 828, 0x14F2008),
+    (0x002EA974, 1252, 0x14F201C),
+    (0x002EAE58, 1148, 0x14F2024),
+    (0x002EB388, 604, 0x14F202C),
+    (0x002EB5E4, 1176, 0x14F2030),
+    (0x002EBA7C, 1332, 0x14F2034),
+    (0x002EC5A0, 1020, 0x14F2040),
+    (0x002ECA68, 11948, 0x14F2048),
+    (0x002F1C60, 9960, 0x14F20AC),
+    (0x002F546C, 2368, 0x14F2130),
+)
+
+# 未产出任何可读字符串的块（二进制表/密钥/纯状态变量），非字符串解密点
+NON_STRING_BLOCKS = (
+    (0x002983DC, 0x14E1240, 15),
+    (0x0029C0C8, 0x14E12D4, 512),
+    (0x0029EED4, 0x14E12E4, 41),
+    (0x002A0A4C, 0x14E12F0, 15),
+    (0x002A489C, 0x14E1308, 24),
+    (0x002A8E7C, 0x14E1350, 13),
+    (0x002B0EAC, 0x14F16D4, 63),
+    (0x002B1D04, 0x14F16DC, 78),
+    (0x002B3324, 0x14F14A0, 1),
+    (0x002B3B1C, 0x14F16E8, 7),
+    (0x002B5FD0, 0x14F16F4, 5),
+    (0x002B6994, 0x14F1708, 512),
+    (0x002B98F4, 0x14F1AD0, 20),
+    (0x002BACAC, 0x14F1B00, 13),
+    (0x002C7348, 0x14F1B20, 32),
+    (0x002C99A0, 0x14F1B30, 16),
+    (0x002CBB70, 0x14F1B68, 12),
+    (0x002CBFB8, 0x14F1B6C, 9),
+    (0x002CC538, 0x14F1B78, 18),
+    (0x002CD2F0, 0x14F1B80, 12),
+    (0x002CD730, 0x14F1B84, 15),
+    (0x002CDB98, 0x14F1B88, 12),
+    (0x002CF348, 0x14F1BA0, 24),
+    (0x002CF838, 0x14F1BA4, 24),
+    (0x002CFD28, 0x14F1BA8, 24),
+    (0x002D0E58, 0x14F1BB8, 15),
+    (0x002D2E74, 0x14F1BD4, 24),
+    (0x002D3494, 0x14F1BE0, 45),
+    (0x002DCC80, 0x14F1CC8, 512),
+    (0x002DFA18, 0x14F1CD4, 10),
+    (0x002DFE94, 0x14F1CD8, 11),
+    (0x002E0324, 0x14F1CDC, 19),
+    (0x002E0828, 0x14F1CE0, 31),
+    (0x002E0DF4, 0x14F1CE4, 14),
+    (0x002E12A8, 0x14F1CE8, 29),
+    (0x002E1850, 0x14F1CEC, 14),
+    (0x002E1D0C, 0x14F1CF0, 16),
+    (0x002E21E8, 0x14F1CF4, 9),
+    (0x002E265C, 0x14F1CF8, 16),
+    (0x002E2B30, 0x14F1CFC, 10),
+    (0x002E2FB4, 0x14F1D00, 12),
+    (0x002E3454, 0x14F1D04, 18),
+    (0x002E3954, 0x14F1D08, 13),
+    (0x002E3E10, 0x14F1D0C, 15),
+    (0x002E42E0, 0x14F1D10, 14),
+    (0x002E479C, 0x14F1D14, 18),
+    (0x002E4DE8, 0x14F1D20, 21),
+    (0x002E5308, 0x14F1D24, 7),
+    (0x002E5758, 0x14F1D28, 10),
+    (0x002E5BD4, 0x14F1D2C, 10),
+    (0x002E7068, 0x14F1FF0, 512),
+    (0x002EA974, 0x14F201C, 16),
+    (0x002EAE58, 0x14F2024, 10),
+    (0x002EB5E4, 0x14F2030, 11),
+    (0x002EBA7C, 0x14F2034, 72),
+    (0x002EC5A0, 0x14F2040, 24),
+    (0x002F546C, 0x14F2130, 31),
+)
+
+CFB_STRIDE   = 32
+CFB_ISA_UTF8 = 0x7C8
+CFB_ISA_UTF16 = 0x7D0
+CFB_ISAS = (CFB_ISA_UTF8, CFB_ISA_UTF16)
+
+# ---------------------------------------------------------------------------
+# [证实] 常量字符串记录 → (isa, ptr, len, 明文, 编码, 解密块)
+# 共 205 条：UTF-8 169 / UTF-16LE 36
+# 键为结构体本体地址（pad 槽），code 传入的是 isa 槽，两者相差 8 字节，
+# 故 CFSTRINGS_ALIAS 同时登记两种地址。
+# ---------------------------------------------------------------------------
+CFSTRINGS = {
+    0x003F67E0: (0x7C8, 0x3F66D2, 1, 'B', 'utf8', 0x00276ED4),
+    0x003F6820: (0x7C8, 0x3F6721, 11, 'tencent.xin', 'utf8', 0x00276ED4),
+    0x003F6860: (0x7C8, 0x3F6790, 18, 'VCamLicenseExpired', 'utf8', 0x00276ED4),
+    0x003F68A0: (0x7C8, 0x3F67AA, 6, 'wechat', 'utf8', 0x00276ED4),
+    0x003F6900: (0x7C8, 0x3F68CE, 13, 'tmp_media.mov', 'utf8', 0x00277CB8),
+    0x003F6960: (0x7C8, 0x3F692B, 10, 'tmp_m_flag', 'utf8', 0x00277F20),
+    0x003F69C0: (0x7C8, 0x3F698D, 12, 'public.movie', 'utf8', 0x00279644),
+    0x003F6A40: (0x7D0, 0x3F6A00, 10, '请输入有效的 URL', 'utf16', 0x0027A584),
+    0x003F6AC0: (0x7D0, 0x3F6A80, 13, '拉流地址验证失败，禁止播放', 'utf16', 0x0027AAA4),
+    0x003F6B20: (0x7D0, 0x3F6AEE, 6, '缓冲中...', 'utf16', 0x0027B8A8),
+    0x003F6B80: (0x7D0, 0x3F6B4A, 4, '播放失败', 'utf16', 0x0027C0E0),
+    0x003F6BD0: (0x7C8, 0x3F6BA2, 1, 'F', 'utf8', 0x0027C2A4),
+    0x003F6C30: (0x7D0, 0x3F6BF6, 2, '错误', 'utf16', 0x0027DD74),
+    0x003F6C70: (0x7D0, 0x3F6C02, 2, '确定', 'utf16', 0x0027DD74),
+    0x003F6D10: (0x7D0, 0x3F6C9C, 5, '网络源预览', 'utf16', 0x0027E5E4),
+    0x003F6D50: (0x7D0, 0x3F6CB6, 6, '加载中...', 'utf16', 0x0027E5E4),
+    0x003F6D90: (0x7D0, 0x3F6CCA, 2, '关闭', 'utf16', 0x0027E5E4),
+    0x003F6DD0: (0x7D0, 0x3F6CDA, 4, '开始替换', 'utf16', 0x0027E5E4),
+    0x003F6E30: (0x7D0, 0x3F6DFE, 6, '加载中...', 'utf16', 0x002801D0),
+    0x003F6EB0: (0x7C8, 0x3F6E70, 18, 'VCamLicenseExpired', 'utf8', 0x00281A80),
+    0x003F6F70: (0x7C8, 0x3F6F10, 54, 'allWindowsIncludingInternalWindows:onlyVisibleWindows:', 'utf8', 0x00285A10),
+    0x003F6FC0: (0x7C8, 0x3F6F92, 1, 'B', 'utf8', 0x00286A00),
+    0x003F7000: (0x7C8, 0x3F6F96, 1, 'F', 'utf8', 0x00286A00),
+    0x003F7150: (0x7D0, 0x3F70B0, 2, '检测', 'utf16', 0x002887B4),
+    0x003F71A0: (0x7C8, 0x3F7175, 4, 'QOBS', 'utf8', 0x0028D490),
+    0x003F7210: (0x7C8, 0x3F71E3, 4, 'QOBS', 'utf8', 0x0028E5E8),
+    0x003F7420: (0x7C8, 0x3F72A0, 19, 'enable_audio_inject', 'utf8', 0x00290158),
+    0x003F7460: (0x7C8, 0x3F72C2, 13, 'enable_mirror', 'utf8', 0x00290158),
+    0x003F74A0: (0x7C8, 0x3F7320, 20, 'enable_video_replace', 'utf8', 0x00290158),
+    0x003F74E0: (0x7D0, 0x3F73E0, 8, '旋转: %ld°', 'utf16', 0x00290158),
+    0x003F7580: (0x7D0, 0x3F750E, 6, '检测中...', 'utf16', 0x002945CC),
+    0x003F75C0: (0x7D0, 0x3F7540, 8, '正在查询拉流配置', 'utf16', 0x002945CC),
+    0x003F76B0: (0x7D0, 0x3F75EA, 4, '检测失败', 'utf16', 0x002951CC),
+    0x003F76F0: (0x7D0, 0x3F7610, 7, '正在连接...', 'utf16', 0x002951CC),
+    0x003F7730: (0x7D0, 0x3F7628, 3, '未配置', 'utf16', 0x002951CC),
+    0x003F7770: (0x7D0, 0x3F7660, 18, '后台未设置拉流地址\n请在网站后台配置', 'utf16', 0x002951CC),
+    0x003F77D0: (0x7C8, 0x3F779E, 13, 'enable_mirror', 'utf8', 0x00296474),
+    0x003F7830: (0x7C8, 0x3F77F9, 8, 'ffPlayer', 'utf8', 0x00296700),
+    0x003F78C0: (0x7C8, 0x3F7870, 19, 'enable_audio_inject', 'utf8', 0x002969C8),
+    0x003F7900: (0x7C8, 0x3F788D, 8, 'ffPlayer', 'utf8', 0x002969C8),
+    0x003F7970: (0x7C8, 0x3F7927, 6, 'Log %@', 'utf8', 0x00296FA4),
+    0x003F79B0: (0x7C8, 0x3F7931, 2, 'ON', 'utf8', 0x00296FA4),
+    0x003F79F0: (0x7C8, 0x3F7938, 3, 'OFF', 'utf8', 0x00296FA4),
+    0x003F7A30: (0x7C8, 0x3F7944, 7, '_vcfg_d', 'utf8', 0x00296FA4),
+    0x003F7A90: (0x7C8, 0x3F7A55, 4, 'D:ON', 'utf8', 0x002974AC),
+    0x003F7AD0: (0x7C8, 0x3F7A60, 5, 'D:OFF', 'utf8', 0x002974AC),
+    0x003F7B50: (0x7C8, 0x3F7B1B, 12, 'public.movie', 'utf8', 0x0029922C),
+    0x003F7BB0: (0x7C8, 0x3F7B7D, 12, 'public.movie', 'utf8', 0x002996BC),
+    0x003F7C40: (0x7C8, 0x3F7BD8, 7, '%d:%02d', 'utf8', 0x00299E9C),
+    0x003F7C80: (0x7C8, 0x3F7C00, 20, '%.0fx%.0f %.0ffps %@', 'utf8', 0x00299E9C),
+    0x003F7D10: (0x7C8, 0x3F7CC0, 18, 'VCamLicenseExpired', 'utf8', 0x0029B3A4),
+    0x003F7D50: (0x7C8, 0x3F7CDB, 7, '_vcfg_d', 'utf8', 0x0029B3A4),
+    0x003F7DB0: (0x7C8, 0x3F7D77, 6, 'reason', 'utf8', 0x0029B810),
+    0x003F7DF0: (0x7C8, 0x3F7D86, 7, 'expired', 'utf8', 0x0029B810),
+    0x003F7E40: (0x7C8, 0x3F7E18, 7, 'expired', 'utf8', 0x0029BF98),
+    0x003F8370: (0x7C8, 0x3F82EA, 7, 'network', 'utf8', 0x002A0F90),
+    0x003F83B0: (0x7C8, 0x3F82FE, 11, 'en_US_POSIX', 'utf8', 0x002A0F90),
+    0x003F83F0: (0x7C8, 0x3F8330, 19, 'yyyy-MM-dd HH:mm:ss', 'utf8', 0x002A0F90),
+    0x003F8620: (0x7C8, 0x3F8432, 9, '%@\n%@: %@', 'utf8', 0x002A190C),
+    0x003F8660: (0x7D0, 0x3F8446, 4, '授权类型', 'utf16', 0x002A190C),
+    0x003F86A0: (0x7D0, 0x3F84A0, 19, '%@\n%@: %ld 天\n%@: %@', 'utf16', 0x002A190C),
+    0x003F86E0: (0x7D0, 0x3F84DE, 4, '到期时间', 'utf16', 0x002A190C),
+    0x003F8720: (0x7D0, 0x3F84EE, 2, '未知', 'utf16', 0x002A190C),
+    0x003F8760: (0x7D0, 0x3F8570, 21, '%@\n%@: %.0f 小时\n%@: %@', 'utf16', 0x002A190C),
+    0x003F87A0: (0x7D0, 0x3F85D0, 21, '%@\n%@: %.0f 分钟\n%@: %@', 'utf16', 0x002A190C),
+    0x003F88F0: (0x7C8, 0x3F885D, 9, '%@ %ld %@', 'utf8', 0x002A5798),
+    0x003F8930: (0x7D0, 0x3F886C, 1, '天', 'utf16', 0x002A5798),
+    0x003F8970: (0x7C8, 0x3F887B, 10, '%@ %.0f %@', 'utf8', 0x002A5798),
+    0x003F89B0: (0x7D0, 0x3F888C, 2, '小时', 'utf16', 0x002A5798),
+    0x003F89F0: (0x7D0, 0x3F8898, 2, '分钟', 'utf16', 0x002A5798),
+    0x003F8A30: (0x7C8, 0x3F88BC, 5, '%@\n%@', 'utf8', 0x002A5798),
+    0x003F8AD0: (0x7C8, 0x3F8A80, 23, 'yyyy-MM-dd HH:mm:ss.SSS', 'utf8', 0x002A8884),
+    0x003F8B10: (0x7C8, 0x3F8AA1, 8, '[%@] %@\n', 'utf8', 0x002A8884),
+    0x003F8B80: (0x7C8, 0x3F8B54, 9, 'dylog.txt', 'utf8', 0x002A92B4),
+    0x003F8DA0: (0x7C8, 0x3F8C40, 19, 'enable_audio_inject', 'utf8', 0x002AB370),
+    0x003F8DE0: (0x7D0, 0x3F8CD0, 54, '[VCam] Tap处理 #%d | frames=%ld buffers=%u ringAvail=%zu', 'utf16', 0x002AB370),
+    0x003F8E60: (0x7C8, 0x3F8E20, 19, 'enable_audio_inject', 'utf8', 0x002AC5AC),
+    0x003F8F20: (0x7C8, 0x3F8EA0, 20, 'enable_video_replace', 'utf8', 0x002AD4A0),
+    0x003F8F60: (0x7C8, 0x3F8EE0, 19, 'enable_audio_inject', 'utf8', 0x002AD4A0),
+    0x003F8FF0: (0x7C8, 0x3F8FC7, 1, 'F', 'utf8', 0x002AD930),
+    0x003F9030: (0x7C8, 0x3F8F82, 1, 'B', 'utf8', 0x002AD930),
+    0x003F9070: (0x7C8, 0x3F8FB0, 20, 'enable_video_replace', 'utf8', 0x002AD930),
+    0x003F9660: (0x7C8, 0x3F9630, 11, 'en_US_POSIX', 'utf8', 0x002BA1AC),
+    0x003FBDE0: (0x7C8, 0x3FBDB5, 4, '%02x', 'utf8', 0x002C6958),
+    0x003FBE40: (0x7C8, 0x3FBE0E, 13, 'response_sign', 'utf8', 0x002C6D20),
+    0x003FBFB0: (0x7C8, 0x3FBEAA, 9, 'timestamp', 'utf8', 0x002C78B4),
+    0x003FBFF0: (0x7C8, 0x3FBEE0, 16, 'application/json', 'utf8', 0x002C78B4),
+    0x003FC030: (0x7C8, 0x3FBEFE, 12, 'Content-Type', 'utf8', 0x002C78B4),
+    0x003FC070: (0x7C8, 0x3FBF11, 5, '%@/%@', 'utf8', 0x002C78B4),
+    0x003FC0B0: (0x7C8, 0x3FBF40, 16, 'abcdef0123456789', 'utf8', 0x002C78B4),
+    0x003FC0F0: (0x7C8, 0x3FBF60, 2, '%C', 'utf8', 0x002C78B4),
+    0x003FC130: (0x7C8, 0x3FBF57, 5, 'nonce', 'utf8', 0x002C78B4),
+    0x003FC170: (0x7C8, 0x3FBF66, 2, '%@', 'utf8', 0x002C78B4),
+    0x003FC1B0: (0x7C8, 0x3FBF6F, 5, '%@=%@', 'utf8', 0x002C78B4),
+    0x003FC1F0: (0x7C8, 0x3FBF77, 1, '&', 'utf8', 0x002C78B4),
+    0x003FC230: (0x7C8, 0x3FBF7E, 4, 'sign', 'utf8', 0x002C78B4),
+    0x003FC270: (0x7C8, 0x3FBF88, 4, 'POST', 'utf8', 0x002C78B4),
+    0x003FC2D0: (0x7C8, 0x3FC29C, 11, 'VCamLicense', 'utf8', 0x002C923C),
+    0x003FC350: (0x7C8, 0x3FC31C, 11, 'en_US_POSIX', 'utf8', 0x002CB004),
+    0x003FC400: (0x7C8, 0x3FC3D7, 4, '%.0f', 'utf8', 0x002CC9C4),
+    0x003FC4B0: (0x7C8, 0x3FC474, 5, 'token', 'utf8', 0x002CE078),
+    0x003FC4F0: (0x7C8, 0x3FC47F, 4, 'udid', 'utf8', 0x002CE078),
+    0x003FC580: (0x7C8, 0x3FC516, 5, 'token', 'utf8', 0x002CE544),
+    0x003FC5C0: (0x7C8, 0x3FC521, 4, 'code', 'utf8', 0x002CE544),
+    0x003FC600: (0x7C8, 0x3FC52E, 7, 'message', 'utf8', 0x002CE544),
+    0x003FC640: (0x7C8, 0x3FC53A, 3, 'msg', 'utf8', 0x002CE544),
+    0x003FC680: (0x7C8, 0x3FC543, 4, 'data', 'utf8', 0x002CE544),
+    0x003FC6C0: (0x7C8, 0x3FC552, 9, 'expire_at', 'utf8', 0x002CE544),
+    0x003FC840: (0x7C8, 0x3FC79D, 4, 'udid', 'utf8', 0x002D02A8),
+    0x003FC880: (0x7C8, 0x3FC7A9, 6, 'action', 'utf8', 0x002D02A8),
+    0x003FC8C0: (0x7C8, 0x3FC7B9, 8, 'activate', 'utf8', 0x002D02A8),
+    0x003FC900: (0x7C8, 0x3FC7CB, 8, 'card_key', 'utf8', 0x002D02A8),
+    0x003FC940: (0x7C8, 0x3FC7DA, 5, 'model', 'utf8', 0x002D02A8),
+    0x003FC980: (0x7C8, 0x3FC7EC, 11, 'ios_version', 'utf8', 0x002D02A8),
+    0x003FC9C0: (0x7C8, 0x3FC803, 10, 'app_bundle', 'utf8', 0x002D02A8),
+    0x003FCA00: (0x7C8, 0x3FC816, 7, 'unknown', 'utf8', 0x002D02A8),
+    0x003FCAD0: (0x7C8, 0x3FCA4A, 11, 'en_US_POSIX', 'utf8', 0x002D137C),
+    0x003FCB10: (0x7C8, 0x3FCA5C, 5, 'token', 'utf8', 0x002D137C),
+    0x003FCB50: (0x7C8, 0x3FCA67, 4, '%.0f', 'utf8', 0x002D137C),
+    0x003FCB90: (0x7C8, 0x3FCA71, 4, 'code', 'utf8', 0x002D137C),
+    0x003FCBD0: (0x7C8, 0x3FCA7E, 7, 'message', 'utf8', 0x002D137C),
+    0x003FCC10: (0x7C8, 0x3FCA8A, 3, 'msg', 'utf8', 0x002D137C),
+    0x003FCC50: (0x7C8, 0x3FCA93, 4, 'data', 'utf8', 0x002D137C),
+    0x003FCC90: (0x7C8, 0x3FCAA2, 9, 'expire_at', 'utf8', 0x002D137C),
+    0x003FCDA0: (0x7C8, 0x3FCD53, 5, 'token', 'utf8', 0x002D3FFC),
+    0x003FCDE0: (0x7C8, 0x3FCD5E, 4, 'udid', 'utf8', 0x002D3FFC),
+    0x003FCE20: (0x7C8, 0x3FCD6E, 10, 'dylib_hash', 'utf8', 0x002D3FFC),
+    0x003FCE80: (0x7C8, 0x3FCE47, 6, 'reason', 'utf8', 0x002D4680),
+    0x003FCEC0: (0x7C8, 0x3FCE56, 7, 'expired', 'utf8', 0x002D4680),
+    0x003FCF60: (0x7C8, 0x3FCEE5, 4, '%.0f', 'utf8', 0x002D4ABC),
+    0x003FCFA0: (0x7C8, 0x3FCEEF, 4, 'code', 'utf8', 0x002D4ABC),
+    0x003FCFE0: (0x7C8, 0x3FCEF9, 4, 'data', 'utf8', 0x002D4ABC),
+    0x003FD020: (0x7C8, 0x3FCF09, 10, 'stream_url', 'utf8', 0x002D4ABC),
+    0x003FD060: (0x7C8, 0x3FCF23, 14, 'stream_enabled', 'utf8', 0x002D4ABC),
+    0x003FD0A0: (0x7C8, 0x3FCF34, 1, '1', 'utf8', 0x002D4ABC),
+    0x003FD0E0: (0x7C8, 0x3FCF38, 1, '0', 'utf8', 0x002D4ABC),
+    0x003FD140: (0x7C8, 0x3FD107, 6, 'reason', 'utf8', 0x002D5A1C),
+    0x003FD180: (0x7C8, 0x3FD116, 7, 'network', 'utf8', 0x002D5A1C),
+    0x003FD1E0: (0x7C8, 0x3FD1A7, 6, 'reason', 'utf8', 0x002D5CF8),
+    0x003FD220: (0x7C8, 0x3FD1B6, 7, 'network', 'utf8', 0x002D5CF8),
+    0x003FD280: (0x7C8, 0x3FD247, 6, 'reason', 'utf8', 0x002D61EC),
+    0x003FD2C0: (0x7C8, 0x3FD256, 7, 'expired', 'utf8', 0x002D61EC),
+    0x003FD320: (0x7C8, 0x3FD2E7, 6, 'reason', 'utf8', 0x002D64C4),
+    0x003FD360: (0x7C8, 0x3FD2F6, 7, 'network', 'utf8', 0x002D64C4),
+    0x003FD3D0: (0x7C8, 0x3FD386, 5, 'token', 'utf8', 0x002D67A0),
+    0x003FD410: (0x7C8, 0x3FD391, 4, 'udid', 'utf8', 0x002D67A0),
+    0x003FD450: (0x7C8, 0x3FD3A1, 10, 'dylib_hash', 'utf8', 0x002D67A0),
+    0x003FD520: (0x7C8, 0x3FD473, 2, '%@', 'utf8', 0x002D6DC4),
+    0x003FD560: (0x7C8, 0x3FD47C, 5, '%@=%@', 'utf8', 0x002D6DC4),
+    0x003FD5A0: (0x7C8, 0x3FD484, 1, '&', 'utf8', 0x002D6DC4),
+    0x003FD5E0: (0x7C8, 0x3FD48B, 4, 'code', 'utf8', 0x002D6DC4),
+    0x003FD620: (0x7C8, 0x3FD495, 4, 'data', 'utf8', 0x002D6DC4),
+    0x003FD660: (0x7C8, 0x3FD4A5, 10, 'dylib_hash', 'utf8', 0x002D6DC4),
+    0x003FD6A0: (0x7C8, 0x3FD4BC, 11, 'config_sign', 'utf8', 0x002D6DC4),
+    0x003FD6E0: (0x7C8, 0x3FD4D7, 14, 'config_version', 'utf8', 0x002D6DC4),
+    0x003FD720: (0x7C8, 0x3FD4EF, 8, 'security', 'utf8', 0x002D6DC4),
+    0x003FD780: (0x7C8, 0x3FD74E, 13, 'feature_flags', 'utf8', 0x002D8528),
+    0x003FD860: (0x7C8, 0x3FD820, 17, 'heartbeat_seconds', 'utf8', 0x002D8B1C),
+    0x003FD8A0: (0x7C8, 0x3FD7C0, 22, 'config_refresh_seconds', 'utf8', 0x002D8B1C),
+    0x003FD8E0: (0x7C8, 0x3FD7E7, 15, 'check_intervals', 'utf8', 0x002D8B1C),
+    0x003FD980: (0x7C8, 0x3FD909, 8, 'security', 'utf8', 0x002D9428),
+    0x003FD9C0: (0x7C8, 0x3FD940, 18, 'anti_debug_enabled', 'utf8', 0x002D9428),
+    0x003FDA10: (0x7C8, 0x3FD9E5, 4, '%02x', 'utf8', 0x002D9B30),
+    0x003FDA60: (0x7C8, 0x3FDA32, 1, '1', 'utf8', 0x002D9FA4),
+    0x003FDAE0: (0x7C8, 0x3FDA86, 5, 'token', 'utf8', 0x002DA170),
+    0x003FDB20: (0x7C8, 0x3FDA91, 4, 'udid', 'utf8', 0x002DA170),
+    0x003FDB60: (0x7C8, 0x3FDA9D, 6, 'action', 'utf8', 0x002DA170),
+    0x003FDBA0: (0x7C8, 0x3FDAA9, 4, 'VCam', 'utf8', 0x002DA170),
+    0x003FDBE0: (0x7D0, 0x3FDAB6, 3, '未授权', 'utf16', 0x002DA170),
+    0x003FDCC0: (0x7C8, 0x3FDC05, 4, 'code', 'utf8', 0x002DAAB0),
+    0x003FDD00: (0x7C8, 0x3FDC12, 7, 'message', 'utf8', 0x002DAAB0),
+    0x003FDD40: (0x7C8, 0x3FDC1F, 4, 'data', 'utf8', 0x002DAAB0),
+    0x003FDD80: (0x7C8, 0x3FDC2F, 10, 'stream_url', 'utf8', 0x002DAAB0),
+    0x003FDDC0: (0x7C8, 0x3FDC49, 14, 'stream_enabled', 'utf8', 0x002DAAB0),
+    0x003FDE00: (0x7C8, 0x3FDC5A, 1, '1', 'utf8', 0x002DAAB0),
+    0x003FDE40: (0x7C8, 0x3FDC5E, 1, '0', 'utf8', 0x002DAAB0),
+    0x003FDE80: (0x7C8, 0x3FDC65, 4, 'VCam', 'utf8', 0x002DAAB0),
+    0x003FDEC0: (0x7D0, 0x3FDC78, 6, '签名验证失败', 'utf16', 0x002DAAB0),
+    0x003FDF00: (0x7D0, 0x3FDC90, 4, '查询失败', 'utf16', 0x002DAAB0),
+    0x003FDF80: (0x7C8, 0x3FDF26, 5, 'token', 'utf8', 0x002DB9A4),
+    0x003FDFC0: (0x7C8, 0x3FDF31, 4, 'udid', 'utf8', 0x002DB9A4),
+    0x003FE000: (0x7C8, 0x3FDF3D, 6, 'action', 'utf8', 0x002DB9A4),
+    0x003FE040: (0x7C8, 0x3FDF4F, 10, 'stream_url', 'utf8', 0x002DB9A4),
+    0x003FE0A0: (0x7C8, 0x3FE065, 4, 'code', 'utf8', 0x002DC158),
+    0x003FE0E0: (0x7C8, 0x3FE06F, 4, 'data', 'utf8', 0x002DC158),
+    0x003FE120: (0x7C8, 0x3FE07A, 5, 'valid', 'utf8', 0x002DC158),
+    0x003FEC90: (0x7C8, 0x3FEC50, 18, 'heartbeatFailCount', 'utf8', 0x002EA284),
+    0x003FED50: (0x7C8, 0x3FED10, 19, 'yyyy-MM-dd HH:mm:ss', 'utf8', 0x002EB388),
+    0x003FF190: (0x7C8, 0x3FEEDF, 4, 'm3u8', 'utf8', 0x002ECA68),
+    0x003FF1D0: (0x7C8, 0x3FEE74, 1, '/', 'utf8', 0x002ECA68),
+    0x003FF210: (0x7D0, 0x3FEE84, 6, '内存分配失败', 'utf16', 0x002ECA68),
+    0x003FF250: (0x7C8, 0x3FEE9A, 7, 'rtmp://', 'utf8', 0x002ECA68),
+    0x003FF290: (0x7C8, 0x3FEEB5, 8, 'rtmps://', 'utf8', 0x002ECA68),
+    0x003FF2D0: (0x7C8, 0x3FEEC6, 7, 'rtsp://', 'utf8', 0x002ECA68),
+    0x003FF310: (0x7C8, 0x3FEED4, 5, '.m3u8', 'utf8', 0x002ECA68),
+    0x003FF350: (0x7C8, 0x3FEE6D, 4, '.flv', 'utf8', 0x002ECA68),
+    0x003FF390: (0x7D0, 0x3FF110, 8, '打开失败: %s', 'utf16', 0x002ECA68),
+    0x003FF3D0: (0x7D0, 0x3FF132, 7, '流信息探测失败', 'utf16', 0x002ECA68),
+    0x003FF410: (0x7D0, 0x3FF152, 7, '未找到音视频流', 'utf16', 0x002ECA68),
+    0x003FF6C0: (0x7C8, 0x3FF487, 4, 'm3u8', 'utf8', 0x002F1C60),
+    0x003FF700: (0x7C8, 0x3FF442, 7, 'rtmp://', 'utf8', 0x002F1C60),
+    0x003FF740: (0x7C8, 0x3FF45D, 8, 'rtmps://', 'utf8', 0x002F1C60),
+    0x003FF780: (0x7C8, 0x3FF46E, 7, 'rtsp://', 'utf8', 0x002F1C60),
+    0x003FF7C0: (0x7C8, 0x3FF47C, 5, '.m3u8', 'utf8', 0x002F1C60),
+    0x003FF800: (0x7C8, 0x3FF435, 4, '.flv', 'utf8', 0x002F1C60),
+}
+
+# struct 本体 → isa 槽（本体 +8），并同时登记反向映射：
+# 代码里 isa 槽和 struct 本体两种地址都会出现，必须双向可查。
+CFSTRINGS_ALIAS = {
+    0x003F67E0: 0x003F67E8,
+    0x003F67E8: 0x003F67E0,
+    0x003F6820: 0x003F6828,
+    0x003F6828: 0x003F6820,
+    0x003F6860: 0x003F6868,
+    0x003F6868: 0x003F6860,
+    0x003F68A0: 0x003F68A8,
+    0x003F68A8: 0x003F68A0,
+    0x003F6900: 0x003F6908,
+    0x003F6908: 0x003F6900,
+    0x003F6960: 0x003F6968,
+    0x003F6968: 0x003F6960,
+    0x003F69C0: 0x003F69C8,
+    0x003F69C8: 0x003F69C0,
+    0x003F6A40: 0x003F6A48,
+    0x003F6A48: 0x003F6A40,
+    0x003F6AC0: 0x003F6AC8,
+    0x003F6AC8: 0x003F6AC0,
+    0x003F6B20: 0x003F6B28,
+    0x003F6B28: 0x003F6B20,
+    0x003F6B80: 0x003F6B88,
+    0x003F6B88: 0x003F6B80,
+    0x003F6BD0: 0x003F6BD8,
+    0x003F6BD8: 0x003F6BD0,
+    0x003F6C30: 0x003F6C38,
+    0x003F6C38: 0x003F6C30,
+    0x003F6C70: 0x003F6C78,
+    0x003F6C78: 0x003F6C70,
+    0x003F6D10: 0x003F6D18,
+    0x003F6D18: 0x003F6D10,
+    0x003F6D50: 0x003F6D58,
+    0x003F6D58: 0x003F6D50,
+    0x003F6D90: 0x003F6D98,
+    0x003F6D98: 0x003F6D90,
+    0x003F6DD0: 0x003F6DD8,
+    0x003F6DD8: 0x003F6DD0,
+    0x003F6E30: 0x003F6E38,
+    0x003F6E38: 0x003F6E30,
+    0x003F6EB0: 0x003F6EB8,
+    0x003F6EB8: 0x003F6EB0,
+    0x003F6F70: 0x003F6F78,
+    0x003F6F78: 0x003F6F70,
+    0x003F6FC0: 0x003F6FC8,
+    0x003F6FC8: 0x003F6FC0,
+    0x003F7000: 0x003F7008,
+    0x003F7008: 0x003F7000,
+    0x003F7150: 0x003F7158,
+    0x003F7158: 0x003F7150,
+    0x003F71A0: 0x003F71A8,
+    0x003F71A8: 0x003F71A0,
+    0x003F7210: 0x003F7218,
+    0x003F7218: 0x003F7210,
+    0x003F7420: 0x003F7428,
+    0x003F7428: 0x003F7420,
+    0x003F7460: 0x003F7468,
+    0x003F7468: 0x003F7460,
+    0x003F74A0: 0x003F74A8,
+    0x003F74A8: 0x003F74A0,
+    0x003F74E0: 0x003F74E8,
+    0x003F74E8: 0x003F74E0,
+    0x003F7580: 0x003F7588,
+    0x003F7588: 0x003F7580,
+    0x003F75C0: 0x003F75C8,
+    0x003F75C8: 0x003F75C0,
+    0x003F76B0: 0x003F76B8,
+    0x003F76B8: 0x003F76B0,
+    0x003F76F0: 0x003F76F8,
+    0x003F76F8: 0x003F76F0,
+    0x003F7730: 0x003F7738,
+    0x003F7738: 0x003F7730,
+    0x003F7770: 0x003F7778,
+    0x003F7778: 0x003F7770,
+    0x003F77D0: 0x003F77D8,
+    0x003F77D8: 0x003F77D0,
+    0x003F7830: 0x003F7838,
+    0x003F7838: 0x003F7830,
+    0x003F78C0: 0x003F78C8,
+    0x003F78C8: 0x003F78C0,
+    0x003F7900: 0x003F7908,
+    0x003F7908: 0x003F7900,
+    0x003F7970: 0x003F7978,
+    0x003F7978: 0x003F7970,
+    0x003F79B0: 0x003F79B8,
+    0x003F79B8: 0x003F79B0,
+    0x003F79F0: 0x003F79F8,
+    0x003F79F8: 0x003F79F0,
+    0x003F7A30: 0x003F7A38,
+    0x003F7A38: 0x003F7A30,
+    0x003F7A90: 0x003F7A98,
+    0x003F7A98: 0x003F7A90,
+    0x003F7AD0: 0x003F7AD8,
+    0x003F7AD8: 0x003F7AD0,
+    0x003F7B50: 0x003F7B58,
+    0x003F7B58: 0x003F7B50,
+    0x003F7BB0: 0x003F7BB8,
+    0x003F7BB8: 0x003F7BB0,
+    0x003F7C40: 0x003F7C48,
+    0x003F7C48: 0x003F7C40,
+    0x003F7C80: 0x003F7C88,
+    0x003F7C88: 0x003F7C80,
+    0x003F7D10: 0x003F7D18,
+    0x003F7D18: 0x003F7D10,
+    0x003F7D50: 0x003F7D58,
+    0x003F7D58: 0x003F7D50,
+    0x003F7DB0: 0x003F7DB8,
+    0x003F7DB8: 0x003F7DB0,
+    0x003F7DF0: 0x003F7DF8,
+    0x003F7DF8: 0x003F7DF0,
+    0x003F7E40: 0x003F7E48,
+    0x003F7E48: 0x003F7E40,
+    0x003F8370: 0x003F8378,
+    0x003F8378: 0x003F8370,
+    0x003F83B0: 0x003F83B8,
+    0x003F83B8: 0x003F83B0,
+    0x003F83F0: 0x003F83F8,
+    0x003F83F8: 0x003F83F0,
+    0x003F8620: 0x003F8628,
+    0x003F8628: 0x003F8620,
+    0x003F8660: 0x003F8668,
+    0x003F8668: 0x003F8660,
+    0x003F86A0: 0x003F86A8,
+    0x003F86A8: 0x003F86A0,
+    0x003F86E0: 0x003F86E8,
+    0x003F86E8: 0x003F86E0,
+    0x003F8720: 0x003F8728,
+    0x003F8728: 0x003F8720,
+    0x003F8760: 0x003F8768,
+    0x003F8768: 0x003F8760,
+    0x003F87A0: 0x003F87A8,
+    0x003F87A8: 0x003F87A0,
+    0x003F88F0: 0x003F88F8,
+    0x003F88F8: 0x003F88F0,
+    0x003F8930: 0x003F8938,
+    0x003F8938: 0x003F8930,
+    0x003F8970: 0x003F8978,
+    0x003F8978: 0x003F8970,
+    0x003F89B0: 0x003F89B8,
+    0x003F89B8: 0x003F89B0,
+    0x003F89F0: 0x003F89F8,
+    0x003F89F8: 0x003F89F0,
+    0x003F8A30: 0x003F8A38,
+    0x003F8A38: 0x003F8A30,
+    0x003F8AD0: 0x003F8AD8,
+    0x003F8AD8: 0x003F8AD0,
+    0x003F8B10: 0x003F8B18,
+    0x003F8B18: 0x003F8B10,
+    0x003F8B80: 0x003F8B88,
+    0x003F8B88: 0x003F8B80,
+    0x003F8DA0: 0x003F8DA8,
+    0x003F8DA8: 0x003F8DA0,
+    0x003F8DE0: 0x003F8DE8,
+    0x003F8DE8: 0x003F8DE0,
+    0x003F8E60: 0x003F8E68,
+    0x003F8E68: 0x003F8E60,
+    0x003F8F20: 0x003F8F28,
+    0x003F8F28: 0x003F8F20,
+    0x003F8F60: 0x003F8F68,
+    0x003F8F68: 0x003F8F60,
+    0x003F8FF0: 0x003F8FF8,
+    0x003F8FF8: 0x003F8FF0,
+    0x003F9030: 0x003F9038,
+    0x003F9038: 0x003F9030,
+    0x003F9070: 0x003F9078,
+    0x003F9078: 0x003F9070,
+    0x003F9660: 0x003F9668,
+    0x003F9668: 0x003F9660,
+    0x003FBDE0: 0x003FBDE8,
+    0x003FBDE8: 0x003FBDE0,
+    0x003FBE40: 0x003FBE48,
+    0x003FBE48: 0x003FBE40,
+    0x003FBFB0: 0x003FBFB8,
+    0x003FBFB8: 0x003FBFB0,
+    0x003FBFF0: 0x003FBFF8,
+    0x003FBFF8: 0x003FBFF0,
+    0x003FC030: 0x003FC038,
+    0x003FC038: 0x003FC030,
+    0x003FC070: 0x003FC078,
+    0x003FC078: 0x003FC070,
+    0x003FC0B0: 0x003FC0B8,
+    0x003FC0B8: 0x003FC0B0,
+    0x003FC0F0: 0x003FC0F8,
+    0x003FC0F8: 0x003FC0F0,
+    0x003FC130: 0x003FC138,
+    0x003FC138: 0x003FC130,
+    0x003FC170: 0x003FC178,
+    0x003FC178: 0x003FC170,
+    0x003FC1B0: 0x003FC1B8,
+    0x003FC1B8: 0x003FC1B0,
+    0x003FC1F0: 0x003FC1F8,
+    0x003FC1F8: 0x003FC1F0,
+    0x003FC230: 0x003FC238,
+    0x003FC238: 0x003FC230,
+    0x003FC270: 0x003FC278,
+    0x003FC278: 0x003FC270,
+    0x003FC2D0: 0x003FC2D8,
+    0x003FC2D8: 0x003FC2D0,
+    0x003FC350: 0x003FC358,
+    0x003FC358: 0x003FC350,
+    0x003FC400: 0x003FC408,
+    0x003FC408: 0x003FC400,
+    0x003FC4B0: 0x003FC4B8,
+    0x003FC4B8: 0x003FC4B0,
+    0x003FC4F0: 0x003FC4F8,
+    0x003FC4F8: 0x003FC4F0,
+    0x003FC580: 0x003FC588,
+    0x003FC588: 0x003FC580,
+    0x003FC5C0: 0x003FC5C8,
+    0x003FC5C8: 0x003FC5C0,
+    0x003FC600: 0x003FC608,
+    0x003FC608: 0x003FC600,
+    0x003FC640: 0x003FC648,
+    0x003FC648: 0x003FC640,
+    0x003FC680: 0x003FC688,
+    0x003FC688: 0x003FC680,
+    0x003FC6C0: 0x003FC6C8,
+    0x003FC6C8: 0x003FC6C0,
+    0x003FC840: 0x003FC848,
+    0x003FC848: 0x003FC840,
+    0x003FC880: 0x003FC888,
+    0x003FC888: 0x003FC880,
+    0x003FC8C0: 0x003FC8C8,
+    0x003FC8C8: 0x003FC8C0,
+    0x003FC900: 0x003FC908,
+    0x003FC908: 0x003FC900,
+    0x003FC940: 0x003FC948,
+    0x003FC948: 0x003FC940,
+    0x003FC980: 0x003FC988,
+    0x003FC988: 0x003FC980,
+    0x003FC9C0: 0x003FC9C8,
+    0x003FC9C8: 0x003FC9C0,
+    0x003FCA00: 0x003FCA08,
+    0x003FCA08: 0x003FCA00,
+    0x003FCAD0: 0x003FCAD8,
+    0x003FCAD8: 0x003FCAD0,
+    0x003FCB10: 0x003FCB18,
+    0x003FCB18: 0x003FCB10,
+    0x003FCB50: 0x003FCB58,
+    0x003FCB58: 0x003FCB50,
+    0x003FCB90: 0x003FCB98,
+    0x003FCB98: 0x003FCB90,
+    0x003FCBD0: 0x003FCBD8,
+    0x003FCBD8: 0x003FCBD0,
+    0x003FCC10: 0x003FCC18,
+    0x003FCC18: 0x003FCC10,
+    0x003FCC50: 0x003FCC58,
+    0x003FCC58: 0x003FCC50,
+    0x003FCC90: 0x003FCC98,
+    0x003FCC98: 0x003FCC90,
+    0x003FCDA0: 0x003FCDA8,
+    0x003FCDA8: 0x003FCDA0,
+    0x003FCDE0: 0x003FCDE8,
+    0x003FCDE8: 0x003FCDE0,
+    0x003FCE20: 0x003FCE28,
+    0x003FCE28: 0x003FCE20,
+    0x003FCE80: 0x003FCE88,
+    0x003FCE88: 0x003FCE80,
+    0x003FCEC0: 0x003FCEC8,
+    0x003FCEC8: 0x003FCEC0,
+    0x003FCF60: 0x003FCF68,
+    0x003FCF68: 0x003FCF60,
+    0x003FCFA0: 0x003FCFA8,
+    0x003FCFA8: 0x003FCFA0,
+    0x003FCFE0: 0x003FCFE8,
+    0x003FCFE8: 0x003FCFE0,
+    0x003FD020: 0x003FD028,
+    0x003FD028: 0x003FD020,
+    0x003FD060: 0x003FD068,
+    0x003FD068: 0x003FD060,
+    0x003FD0A0: 0x003FD0A8,
+    0x003FD0A8: 0x003FD0A0,
+    0x003FD0E0: 0x003FD0E8,
+    0x003FD0E8: 0x003FD0E0,
+    0x003FD140: 0x003FD148,
+    0x003FD148: 0x003FD140,
+    0x003FD180: 0x003FD188,
+    0x003FD188: 0x003FD180,
+    0x003FD1E0: 0x003FD1E8,
+    0x003FD1E8: 0x003FD1E0,
+    0x003FD220: 0x003FD228,
+    0x003FD228: 0x003FD220,
+    0x003FD280: 0x003FD288,
+    0x003FD288: 0x003FD280,
+    0x003FD2C0: 0x003FD2C8,
+    0x003FD2C8: 0x003FD2C0,
+    0x003FD320: 0x003FD328,
+    0x003FD328: 0x003FD320,
+    0x003FD360: 0x003FD368,
+    0x003FD368: 0x003FD360,
+    0x003FD3D0: 0x003FD3D8,
+    0x003FD3D8: 0x003FD3D0,
+    0x003FD410: 0x003FD418,
+    0x003FD418: 0x003FD410,
+    0x003FD450: 0x003FD458,
+    0x003FD458: 0x003FD450,
+    0x003FD520: 0x003FD528,
+    0x003FD528: 0x003FD520,
+    0x003FD560: 0x003FD568,
+    0x003FD568: 0x003FD560,
+    0x003FD5A0: 0x003FD5A8,
+    0x003FD5A8: 0x003FD5A0,
+    0x003FD5E0: 0x003FD5E8,
+    0x003FD5E8: 0x003FD5E0,
+    0x003FD620: 0x003FD628,
+    0x003FD628: 0x003FD620,
+    0x003FD660: 0x003FD668,
+    0x003FD668: 0x003FD660,
+    0x003FD6A0: 0x003FD6A8,
+    0x003FD6A8: 0x003FD6A0,
+    0x003FD6E0: 0x003FD6E8,
+    0x003FD6E8: 0x003FD6E0,
+    0x003FD720: 0x003FD728,
+    0x003FD728: 0x003FD720,
+    0x003FD780: 0x003FD788,
+    0x003FD788: 0x003FD780,
+    0x003FD860: 0x003FD868,
+    0x003FD868: 0x003FD860,
+    0x003FD8A0: 0x003FD8A8,
+    0x003FD8A8: 0x003FD8A0,
+    0x003FD8E0: 0x003FD8E8,
+    0x003FD8E8: 0x003FD8E0,
+    0x003FD980: 0x003FD988,
+    0x003FD988: 0x003FD980,
+    0x003FD9C0: 0x003FD9C8,
+    0x003FD9C8: 0x003FD9C0,
+    0x003FDA10: 0x003FDA18,
+    0x003FDA18: 0x003FDA10,
+    0x003FDA60: 0x003FDA68,
+    0x003FDA68: 0x003FDA60,
+    0x003FDAE0: 0x003FDAE8,
+    0x003FDAE8: 0x003FDAE0,
+    0x003FDB20: 0x003FDB28,
+    0x003FDB28: 0x003FDB20,
+    0x003FDB60: 0x003FDB68,
+    0x003FDB68: 0x003FDB60,
+    0x003FDBA0: 0x003FDBA8,
+    0x003FDBA8: 0x003FDBA0,
+    0x003FDBE0: 0x003FDBE8,
+    0x003FDBE8: 0x003FDBE0,
+    0x003FDCC0: 0x003FDCC8,
+    0x003FDCC8: 0x003FDCC0,
+    0x003FDD00: 0x003FDD08,
+    0x003FDD08: 0x003FDD00,
+    0x003FDD40: 0x003FDD48,
+    0x003FDD48: 0x003FDD40,
+    0x003FDD80: 0x003FDD88,
+    0x003FDD88: 0x003FDD80,
+    0x003FDDC0: 0x003FDDC8,
+    0x003FDDC8: 0x003FDDC0,
+    0x003FDE00: 0x003FDE08,
+    0x003FDE08: 0x003FDE00,
+    0x003FDE40: 0x003FDE48,
+    0x003FDE48: 0x003FDE40,
+    0x003FDE80: 0x003FDE88,
+    0x003FDE88: 0x003FDE80,
+    0x003FDEC0: 0x003FDEC8,
+    0x003FDEC8: 0x003FDEC0,
+    0x003FDF00: 0x003FDF08,
+    0x003FDF08: 0x003FDF00,
+    0x003FDF80: 0x003FDF88,
+    0x003FDF88: 0x003FDF80,
+    0x003FDFC0: 0x003FDFC8,
+    0x003FDFC8: 0x003FDFC0,
+    0x003FE000: 0x003FE008,
+    0x003FE008: 0x003FE000,
+    0x003FE040: 0x003FE048,
+    0x003FE048: 0x003FE040,
+    0x003FE0A0: 0x003FE0A8,
+    0x003FE0A8: 0x003FE0A0,
+    0x003FE0E0: 0x003FE0E8,
+    0x003FE0E8: 0x003FE0E0,
+    0x003FE120: 0x003FE128,
+    0x003FE128: 0x003FE120,
+    0x003FEC90: 0x003FEC98,
+    0x003FEC98: 0x003FEC90,
+    0x003FED50: 0x003FED58,
+    0x003FED58: 0x003FED50,
+    0x003FF190: 0x003FF198,
+    0x003FF198: 0x003FF190,
+    0x003FF1D0: 0x003FF1D8,
+    0x003FF1D8: 0x003FF1D0,
+    0x003FF210: 0x003FF218,
+    0x003FF218: 0x003FF210,
+    0x003FF250: 0x003FF258,
+    0x003FF258: 0x003FF250,
+    0x003FF290: 0x003FF298,
+    0x003FF298: 0x003FF290,
+    0x003FF2D0: 0x003FF2D8,
+    0x003FF2D8: 0x003FF2D0,
+    0x003FF310: 0x003FF318,
+    0x003FF318: 0x003FF310,
+    0x003FF350: 0x003FF358,
+    0x003FF358: 0x003FF350,
+    0x003FF390: 0x003FF398,
+    0x003FF398: 0x003FF390,
+    0x003FF3D0: 0x003FF3D8,
+    0x003FF3D8: 0x003FF3D0,
+    0x003FF410: 0x003FF418,
+    0x003FF418: 0x003FF410,
+    0x003FF6C0: 0x003FF6C8,
+    0x003FF6C8: 0x003FF6C0,
+    0x003FF700: 0x003FF708,
+    0x003FF708: 0x003FF700,
+    0x003FF740: 0x003FF748,
+    0x003FF748: 0x003FF740,
+    0x003FF780: 0x003FF788,
+    0x003FF788: 0x003FF780,
+    0x003FF7C0: 0x003FF7C8,
+    0x003FF7C8: 0x003FF7C0,
+    0x003FF800: 0x003FF808,
+    0x003FF808: 0x003FF800,
+}
+
+# ---------------------------------------------------------------------------
+# [证实] 解密目标缓冲地址（ptr）→ 明文，共 205 条
+# ---------------------------------------------------------------------------
+ASCII_STRINGS = {
+    0x003F66D2: 'B',   # 0x00276ED4
+    0x003F6721: 'tencent.xin',   # 0x00276ED4
+    0x003F6790: 'VCamLicenseExpired',   # 0x00276ED4
+    0x003F67AA: 'wechat',   # 0x00276ED4
+    0x003F68CE: 'tmp_media.mov',   # 0x00277CB8
+    0x003F692B: 'tmp_m_flag',   # 0x00277F20
+    0x003F698D: 'public.movie',   # 0x00279644
+    0x003F6BA2: 'F',   # 0x0027C2A4
+    0x003F6E70: 'VCamLicenseExpired',   # 0x00281A80
+    0x003F6F10: 'allWindowsIncludingInternalWindows:onlyVisibleWindows:',   # 0x00285A10
+    0x003F6F92: 'B',   # 0x00286A00
+    0x003F6F96: 'F',   # 0x00286A00
+    0x003F7175: 'QOBS',   # 0x0028D490
+    0x003F71E3: 'QOBS',   # 0x0028E5E8
+    0x003F72A0: 'enable_audio_inject',   # 0x00290158
+    0x003F72C2: 'enable_mirror',   # 0x00290158
+    0x003F7320: 'enable_video_replace',   # 0x00290158
+    0x003F779E: 'enable_mirror',   # 0x00296474
+    0x003F77F9: 'ffPlayer',   # 0x00296700
+    0x003F7870: 'enable_audio_inject',   # 0x002969C8
+    0x003F788D: 'ffPlayer',   # 0x002969C8
+    0x003F7927: 'Log %@',   # 0x00296FA4
+    0x003F7931: 'ON',   # 0x00296FA4
+    0x003F7938: 'OFF',   # 0x00296FA4
+    0x003F7944: '_vcfg_d',   # 0x00296FA4
+    0x003F7A55: 'D:ON',   # 0x002974AC
+    0x003F7A60: 'D:OFF',   # 0x002974AC
+    0x003F7B1B: 'public.movie',   # 0x0029922C
+    0x003F7B7D: 'public.movie',   # 0x002996BC
+    0x003F7BD8: '%d:%02d',   # 0x00299E9C
+    0x003F7C00: '%.0fx%.0f %.0ffps %@',   # 0x00299E9C
+    0x003F7CC0: 'VCamLicenseExpired',   # 0x0029B3A4
+    0x003F7CDB: '_vcfg_d',   # 0x0029B3A4
+    0x003F7D77: 'reason',   # 0x0029B810
+    0x003F7D86: 'expired',   # 0x0029B810
+    0x003F7E18: 'expired',   # 0x0029BF98
+    0x003F82EA: 'network',   # 0x002A0F90
+    0x003F82FE: 'en_US_POSIX',   # 0x002A0F90
+    0x003F8330: 'yyyy-MM-dd HH:mm:ss',   # 0x002A0F90
+    0x003F8432: '%@\n%@: %@',   # 0x002A190C
+    0x003F885D: '%@ %ld %@',   # 0x002A5798
+    0x003F887B: '%@ %.0f %@',   # 0x002A5798
+    0x003F88BC: '%@\n%@',   # 0x002A5798
+    0x003F8A80: 'yyyy-MM-dd HH:mm:ss.SSS',   # 0x002A8884
+    0x003F8AA1: '[%@] %@\n',   # 0x002A8884
+    0x003F8B54: 'dylog.txt',   # 0x002A92B4
+    0x003F8C40: 'enable_audio_inject',   # 0x002AB370
+    0x003F8E20: 'enable_audio_inject',   # 0x002AC5AC
+    0x003F8EA0: 'enable_video_replace',   # 0x002AD4A0
+    0x003F8EE0: 'enable_audio_inject',   # 0x002AD4A0
+    0x003F8F82: 'B',   # 0x002AD930
+    0x003F8FB0: 'enable_video_replace',   # 0x002AD930
+    0x003F8FC7: 'F',   # 0x002AD930
+    0x003F9630: 'en_US_POSIX',   # 0x002BA1AC
+    0x003FBDB5: '%02x',   # 0x002C6958
+    0x003FBE0E: 'response_sign',   # 0x002C6D20
+    0x003FBEAA: 'timestamp',   # 0x002C78B4
+    0x003FBEE0: 'application/json',   # 0x002C78B4
+    0x003FBEFE: 'Content-Type',   # 0x002C78B4
+    0x003FBF11: '%@/%@',   # 0x002C78B4
+    0x003FBF40: 'abcdef0123456789',   # 0x002C78B4
+    0x003FBF57: 'nonce',   # 0x002C78B4
+    0x003FBF60: '%C',   # 0x002C78B4
+    0x003FBF66: '%@',   # 0x002C78B4
+    0x003FBF6F: '%@=%@',   # 0x002C78B4
+    0x003FBF77: '&',   # 0x002C78B4
+    0x003FBF7E: 'sign',   # 0x002C78B4
+    0x003FBF88: 'POST',   # 0x002C78B4
+    0x003FC29C: 'VCamLicense',   # 0x002C923C
+    0x003FC31C: 'en_US_POSIX',   # 0x002CB004
+    0x003FC3D7: '%.0f',   # 0x002CC9C4
+    0x003FC474: 'token',   # 0x002CE078
+    0x003FC47F: 'udid',   # 0x002CE078
+    0x003FC516: 'token',   # 0x002CE544
+    0x003FC521: 'code',   # 0x002CE544
+    0x003FC52E: 'message',   # 0x002CE544
+    0x003FC53A: 'msg',   # 0x002CE544
+    0x003FC543: 'data',   # 0x002CE544
+    0x003FC552: 'expire_at',   # 0x002CE544
+    0x003FC79D: 'udid',   # 0x002D02A8
+    0x003FC7A9: 'action',   # 0x002D02A8
+    0x003FC7B9: 'activate',   # 0x002D02A8
+    0x003FC7CB: 'card_key',   # 0x002D02A8
+    0x003FC7DA: 'model',   # 0x002D02A8
+    0x003FC7EC: 'ios_version',   # 0x002D02A8
+    0x003FC803: 'app_bundle',   # 0x002D02A8
+    0x003FC816: 'unknown',   # 0x002D02A8
+    0x003FCA4A: 'en_US_POSIX',   # 0x002D137C
+    0x003FCA5C: 'token',   # 0x002D137C
+    0x003FCA67: '%.0f',   # 0x002D137C
+    0x003FCA71: 'code',   # 0x002D137C
+    0x003FCA7E: 'message',   # 0x002D137C
+    0x003FCA8A: 'msg',   # 0x002D137C
+    0x003FCA93: 'data',   # 0x002D137C
+    0x003FCAA2: 'expire_at',   # 0x002D137C
+    0x003FCD53: 'token',   # 0x002D3FFC
+    0x003FCD5E: 'udid',   # 0x002D3FFC
+    0x003FCD6E: 'dylib_hash',   # 0x002D3FFC
+    0x003FCE47: 'reason',   # 0x002D4680
+    0x003FCE56: 'expired',   # 0x002D4680
+    0x003FCEE5: '%.0f',   # 0x002D4ABC
+    0x003FCEEF: 'code',   # 0x002D4ABC
+    0x003FCEF9: 'data',   # 0x002D4ABC
+    0x003FCF09: 'stream_url',   # 0x002D4ABC
+    0x003FCF23: 'stream_enabled',   # 0x002D4ABC
+    0x003FCF34: '1',   # 0x002D4ABC
+    0x003FCF38: '0',   # 0x002D4ABC
+    0x003FD107: 'reason',   # 0x002D5A1C
+    0x003FD116: 'network',   # 0x002D5A1C
+    0x003FD1A7: 'reason',   # 0x002D5CF8
+    0x003FD1B6: 'network',   # 0x002D5CF8
+    0x003FD247: 'reason',   # 0x002D61EC
+    0x003FD256: 'expired',   # 0x002D61EC
+    0x003FD2E7: 'reason',   # 0x002D64C4
+    0x003FD2F6: 'network',   # 0x002D64C4
+    0x003FD386: 'token',   # 0x002D67A0
+    0x003FD391: 'udid',   # 0x002D67A0
+    0x003FD3A1: 'dylib_hash',   # 0x002D67A0
+    0x003FD473: '%@',   # 0x002D6DC4
+    0x003FD47C: '%@=%@',   # 0x002D6DC4
+    0x003FD484: '&',   # 0x002D6DC4
+    0x003FD48B: 'code',   # 0x002D6DC4
+    0x003FD495: 'data',   # 0x002D6DC4
+    0x003FD4A5: 'dylib_hash',   # 0x002D6DC4
+    0x003FD4BC: 'config_sign',   # 0x002D6DC4
+    0x003FD4D7: 'config_version',   # 0x002D6DC4
+    0x003FD4EF: 'security',   # 0x002D6DC4
+    0x003FD74E: 'feature_flags',   # 0x002D8528
+    0x003FD7C0: 'config_refresh_seconds',   # 0x002D8B1C
+    0x003FD7E7: 'check_intervals',   # 0x002D8B1C
+    0x003FD820: 'heartbeat_seconds',   # 0x002D8B1C
+    0x003FD909: 'security',   # 0x002D9428
+    0x003FD940: 'anti_debug_enabled',   # 0x002D9428
+    0x003FD9E5: '%02x',   # 0x002D9B30
+    0x003FDA32: '1',   # 0x002D9FA4
+    0x003FDA86: 'token',   # 0x002DA170
+    0x003FDA91: 'udid',   # 0x002DA170
+    0x003FDA9D: 'action',   # 0x002DA170
+    0x003FDAA9: 'VCam',   # 0x002DA170
+    0x003FDC05: 'code',   # 0x002DAAB0
+    0x003FDC12: 'message',   # 0x002DAAB0
+    0x003FDC1F: 'data',   # 0x002DAAB0
+    0x003FDC2F: 'stream_url',   # 0x002DAAB0
+    0x003FDC49: 'stream_enabled',   # 0x002DAAB0
+    0x003FDC5A: '1',   # 0x002DAAB0
+    0x003FDC5E: '0',   # 0x002DAAB0
+    0x003FDC65: 'VCam',   # 0x002DAAB0
+    0x003FDF26: 'token',   # 0x002DB9A4
+    0x003FDF31: 'udid',   # 0x002DB9A4
+    0x003FDF3D: 'action',   # 0x002DB9A4
+    0x003FDF4F: 'stream_url',   # 0x002DB9A4
+    0x003FE065: 'code',   # 0x002DC158
+    0x003FE06F: 'data',   # 0x002DC158
+    0x003FE07A: 'valid',   # 0x002DC158
+    0x003FEC50: 'heartbeatFailCount',   # 0x002EA284
+    0x003FED10: 'yyyy-MM-dd HH:mm:ss',   # 0x002EB388
+    0x003FEE6D: '.flv',   # 0x002ECA68
+    0x003FEE74: '/',   # 0x002ECA68
+    0x003FEE9A: 'rtmp://',   # 0x002ECA68
+    0x003FEEB5: 'rtmps://',   # 0x002ECA68
+    0x003FEEC6: 'rtsp://',   # 0x002ECA68
+    0x003FEED4: '.m3u8',   # 0x002ECA68
+    0x003FEEDF: 'm3u8',   # 0x002ECA68
+    0x003FF435: '.flv',   # 0x002F1C60
+    0x003FF442: 'rtmp://',   # 0x002F1C60
+    0x003FF45D: 'rtmps://',   # 0x002F1C60
+    0x003FF46E: 'rtsp://',   # 0x002F1C60
+    0x003FF47C: '.m3u8',   # 0x002F1C60
+    0x003FF487: 'm3u8',   # 0x002F1C60
+}
+
+# [证实] UTF-16LE 目标缓冲 → 明文（len 以 UTF-16 code unit 计，字节数为 2*len）
+UTF16_STRINGS = {
+    0x003F6A00: '请输入有效的 URL',   # 0x0027A584, 20B
+    0x003F6A80: '拉流地址验证失败，禁止播放',   # 0x0027AAA4, 26B
+    0x003F6AEE: '缓冲中...',   # 0x0027B8A8, 12B
+    0x003F6B4A: '播放失败',   # 0x0027C0E0, 8B
+    0x003F6BF6: '错误',   # 0x0027DD74, 4B
+    0x003F6C02: '确定',   # 0x0027DD74, 4B
+    0x003F6C9C: '网络源预览',   # 0x0027E5E4, 10B
+    0x003F6CB6: '加载中...',   # 0x0027E5E4, 12B
+    0x003F6CCA: '关闭',   # 0x0027E5E4, 4B
+    0x003F6CDA: '开始替换',   # 0x0027E5E4, 8B
+    0x003F6DFE: '加载中...',   # 0x002801D0, 12B
+    0x003F70B0: '检测',   # 0x002887B4, 4B
+    0x003F73E0: '旋转: %ld°',   # 0x00290158, 16B
+    0x003F750E: '检测中...',   # 0x002945CC, 12B
+    0x003F7540: '正在查询拉流配置',   # 0x002945CC, 16B
+    0x003F75EA: '检测失败',   # 0x002951CC, 8B
+    0x003F7610: '正在连接...',   # 0x002951CC, 14B
+    0x003F7628: '未配置',   # 0x002951CC, 6B
+    0x003F7660: '后台未设置拉流地址\n请在网站后台配置',   # 0x002951CC, 36B
+    0x003F8446: '授权类型',   # 0x002A190C, 8B
+    0x003F84A0: '%@\n%@: %ld 天\n%@: %@',   # 0x002A190C, 38B
+    0x003F84DE: '到期时间',   # 0x002A190C, 8B
+    0x003F84EE: '未知',   # 0x002A190C, 4B
+    0x003F8570: '%@\n%@: %.0f 小时\n%@: %@',   # 0x002A190C, 42B
+    0x003F85D0: '%@\n%@: %.0f 分钟\n%@: %@',   # 0x002A190C, 42B
+    0x003F886C: '天',   # 0x002A5798, 2B
+    0x003F888C: '小时',   # 0x002A5798, 4B
+    0x003F8898: '分钟',   # 0x002A5798, 4B
+    0x003F8CD0: '[VCam] Tap处理 #%d | frames=%ld buffers=%u ringAvail=%zu',   # 0x002AB370, 108B
+    0x003FDAB6: '未授权',   # 0x002DA170, 6B
+    0x003FDC78: '签名验证失败',   # 0x002DAAB0, 12B
+    0x003FDC90: '查询失败',   # 0x002DAAB0, 8B
+    0x003FEE84: '内存分配失败',   # 0x002ECA68, 12B
+    0x003FF110: '打开失败: %s',   # 0x002ECA68, 16B
+    0x003FF132: '流信息探测失败',   # 0x002ECA68, 14B
+    0x003FF152: '未找到音视频流',   # 0x002ECA68, 14B
+}
+
+PLAINTEXT = dict(ASCII_STRINGS)
+PLAINTEXT.update(UTF16_STRINGS)
+
+# 宿主 App 白名单（[证实] init 内两次 containsString:）
+HOST_CHECK_S1_ADDR = 0x003F6820          # ptr=0x3f6721 len=11
+HOST_CHECK_S1      = 'tencent.xin'
+HOST_CHECK_S2_ADDR = 0x003F68A0          # ptr=0x3f67aa len=6
+HOST_CHECK_S2      = 'wechat'
+
+# init 内 objc_storeStrong 存入的单字符常量
+FILENAME_CHAR_ADDR = 0x003F67E0          # ptr=0x3f66d2 len=1
+FILENAME_CHAR      = 'B'
+
+# init 内 NSNotificationCenter 观察者名字
+LICENSE_NOTIFY_ADDR = 0x003F6860         # ptr=0x3f6790 len=18
+LICENSE_NOTIFY      = 'VCamLicenseExpired'
+
+# ---------------------------------------------------------------------------
+# [证实] 新 replay 出来的关键字面量（此前 15 块未覆盖）
+# ---------------------------------------------------------------------------
+ENABLE_AUDIO_INJECT        = 0x003F7420   # 'enable_audio_inject'
+ENABLE_VIDEO_REPLACE       = 0x003F74A0   # 'enable_video_replace'
+ENABLE_MIRROR              = 0x003F7460   # 'enable_mirror'
+APPLICATION_JSON           = 0x003FBFF0   # 'application/json'
+CONTENT_TYPE               = 0x003FC030   # 'Content-Type'
+ABCDEF0123456789           = 0x003FC0B0   # 'abcdef0123456789'
+CARD_KEY                   = 0x003FC900   # 'card_key'
+ACTIVATE                   = 0x003FC8C0   # 'activate'
+DYLIB_HASH                 = 0x003FCE20   # 'dylib_hash'
+CONFIG_SIGN                = 0x003FD6A0   # 'config_sign'
+CONFIG_VERSION             = 0x003FD6E0   # 'config_version'
+HEARTBEAT_SECONDS          = 0x003FD860   # 'heartbeat_seconds'
+CONFIG_REFRESH_SECONDS     = 0x003FD8A0   # 'config_refresh_seconds'
+STREAM_URL                 = 0x003FD020   # 'stream_url'
+STREAM_ENABLED             = 0x003FD060   # 'stream_enabled'
+APP_BUNDLE                 = 0x003FC9C0   # 'app_bundle'
+IOS_VERSION                = 0x003FC980   # 'ios_version'
+SECURITY                   = 0x003FD720   # 'security'
+YYYY_MM_DD_HH_MM_SS_SSS    = 0x003F8AD0   # 'yyyy-MM-dd HH:mm:ss.SSS'
+EN_US_POSIX                = 0x003F83B0   # 'en_US_POSIX'
+
+
+def _decode(raw, enc):
+    """[证实] 按 isa 选定的编码解码；utf16 的 raw 必须是 2*len 字节。"""
+    if enc == "utf16":
+        if len(raw) % 2:
+            raise ValueError(f"odd UTF-16LE length {len(raw)}")
+        return raw.decode("utf-16-le")
+    return raw.decode("utf-8")
+
+
+def _nbytes(isa, ln):
+    """[证实] isa 决定 len 的单位：0x7c8 字节，0x7d0 UTF-16 code unit。"""
+    return ln if isa == CFB_ISA_UTF8 else 2 * ln
+
+
+def _unpack_record(seg, addr):
+    """在 addr 处按 [pad][isa][ptr][len] 解析，addr 可以是本体或 isa 槽。"""
+    for base in (addr, addr - 8):
+        if base < 0:
+            continue
+        hdr = bytes(seg.read(base, 24))
+        isa, ptr, ln = struct.unpack_from("<QQQ", hdr, 8)
+        if isa in CFB_ISAS and 0 < ln < 0x1000:
+            return isa, ptr, ln
+    raise KeyError(f"no constant-string record at 0x{addr:x}")
+
+
+def _lookup(addr):
+    """[证实] CFSTRINGS 以结构体本体（pad 槽）为键，但代码里出现的是 isa 槽
+    （本体 +8），两种地址都要能查到同一条记录。"""
+    if addr in CFSTRINGS:
+        return CFSTRINGS[addr]
+    alias = CFSTRINGS_ALIAS.get(addr)
+    if alias is not None and alias in CFSTRINGS:
+        return CFSTRINGS[alias]
+    return None
+
+
+def read_cfstring(seg, addr):
+    """[证实] 解析常量字符串记录并返回明文。
+
+    addr 既可以是 32 字节记录本体（pad 槽），也可以是 isa 槽（本体 +8）。
+    UTF-16LE 按 2*len 字节读取——这是旧实现把中文截半的根因。
+    """
+    rec = _lookup(addr)
+    if rec:
+        return rec[3]
+    isa, ptr, ln = _unpack_record(seg, addr)
+    return _decode(bytes(seg.read(ptr, _nbytes(isa, ln))),
+                   "utf8" if isa == CFB_ISA_UTF8 else "utf16")
+
+
+def cfstring_encoding(seg_or_addr_map, addr):
+    """返回该地址使用的编码：'utf8' / 'utf16' / None。"""
+    rec = _lookup(addr)
+    if rec:
+        return rec[4]
+    if addr in UTF16_STRINGS:
+        return "utf16"
+    if addr in ASCII_STRINGS:
+        return "utf8"
+    return None
+
+
+def deobfuscate_strings_once(seg, flags):
+    """[证实] 全部解密块的一次性语义。
+
+    与二进制一致：每个块先 ldar 自己的 __bss 标志，已置位则跳过。
+    静态明文见 ASCII_STRINGS / UTF16_STRINGS / CFSTRINGS，因此这里只做
+    幂等 bookkeeping，不再对内存做任何变换（真实二进制中源密文与目标明文
+    地址不同，重复执行是安全的）。
+    """
+    executed = []
+    for entry, _size, flag in DEOBF_SITES:
+        if flags.get(flag, 0):
+            continue
+        flags[flag] = 1
+        executed.append(entry)
+    return executed
+
+
+def deobf_string(seg_or_none, addr):
+    """menu.py 等模块使用的统一入口：把任意字符串地址解析成明文。"""
+    rec = _lookup(addr)
+    if rec:
+        return rec[3]
+    if addr in PLAINTEXT:
+        return PLAINTEXT[addr]
+    if seg_or_none is None:
+        raise KeyError(f"0x{addr:x} needs a live segment to read")
+    return read_cfstring(seg_or_none, addr)
+
+
+if __name__ == "__main__":
+    print(f"=== {len(DEOBF_SITES)} 个解密块 ===")
+    for e, s, f in DEOBF_SITES:
+        print(f"  0x{e:08x}  {s:6d} B  flag 0x{f:x}")
+
+    print(f"\n=== 常量字符串记录 ({len(CFSTRINGS)}) ===")
+    for a, rec in sorted(CFSTRINGS.items()):
+        isa, p, n, t, enc, blk = rec
+        src = f"  <- 0x{blk:08x}" if blk else ""
+        print(f"  struct 0x{a:08x} isa=0x{isa:x} ptr 0x{p:08x} len {n:<3d} "
+              f"[{enc}] {t!r}{src}")
+
+    print(f"\n=== UTF-8 目标缓冲 ({len(ASCII_STRINGS)}) ===")
+    for a, t in sorted(ASCII_STRINGS.items()):
+        print(f"  0x{a:08x}  {t!r}")
+
+    print(f"\n=== UTF-16LE 目标缓冲 ({len(UTF16_STRINGS)}) ===")
+    for a, t in sorted(UTF16_STRINGS.items()):
+        print(f"  0x{a:08x}  {t!r}")
