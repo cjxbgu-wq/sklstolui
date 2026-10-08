@@ -1,37 +1,97 @@
-name: Python CI
+name: Build
 
 on:
   push:
     branches: [ "main" ]
+    tags:   [ "v*" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
+    name: Syntax check & package
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      # 1. 检出仓库（fetch-depth: 0 让 git ls-files 与 tag 都完整）
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.10"
+      # 2. 准备 Python 环境
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-    - name: Check syntax
-      run: |
-        python -m py_compile *.py
+      # 3. 依赖（本项目 requirements.txt 为空，pip 会直接跳过）
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -s requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt empty or missing, skip."
+          fi
 
-    - name: Package source snapshot
-      run: |
-        mkdir -p dist
-        zip -r dist/vacm-decompiled-source.zip \
-            *.py requirements.txt README.md scripts/ \
-            -x "*.pyc" -x "__pycache__/*"
+      # 4. 语法检查：任何 .py 有语法错误这里会失败
+      - name: Syntax check
+        run: |
+          set -e
+          echo "== Python files =="
+          find . -type f -name "*.py" -not -path "./.git/*" -print0 \
+            | xargs -0 -n1 python -m py_compile
+          echo "All Python files compiled OK."
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: vacm-decompiled-source
-        path: dist/vacm-decompiled-source.zip
+      # 5. 生成文件清单（放进包里，方便核对每次快照内容）
+      - name: Generate manifest
+        run: |
+          mkdir -p dist
+          {
+            echo "# Build manifest"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "ref:    ${GITHUB_REF}"
+            echo "date:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "## Tracked files"
+            git ls-files
+          } > dist/MANIFEST.txt
+          cat dist/MANIFEST.txt
+
+      # 6. 打包：只打包仓库跟踪的文件，避免把 .git / __pycache__ 带进去
+      - name: Package source snapshot
+        run: |
+          set -e
+          FILES=$(git ls-files)
+          zip -r dist/vacm-decompiled-source.zip $FILES dist/MANIFEST.txt
+          echo "--- zip contents ---"
+          unzip -l dist/vacm-decompiled-source.zip
+          echo "--- checksum ---"
+          sha256sum dist/vacm-decompiled-source.zip | tee dist/vacm-decompiled-source.zip.sha256
+
+      # 7. 上传 artifact（每次 push 都能在 Actions 页下载）
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vacm-decompiled-source
+          path: |
+            dist/vacm-decompiled-source.zip
+            dist/vacm-decompiled-source.zip.sha256
+            dist/MANIFEST.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # 8. 打 tag 时自动挂到 Release（v1.0.0 之类）
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vacm-decompiled-source.zip
+            dist/vacm-decompiled-source.zip.sha256
+          generate_release_notes: true
